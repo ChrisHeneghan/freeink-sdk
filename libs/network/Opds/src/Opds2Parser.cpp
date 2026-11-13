@@ -2,6 +2,7 @@
 
 #include <OpdsLog.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,11 +18,12 @@ static_assert(MAX_HREF_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1 &&
                   MAX_PAGE_URL_CHARS < StreamingJsonParser::TOKEN_BUF_SIZE - 1,
               "OPDS field limits must fit the JSON token buffer or values are dropped by tokenOverflow");
 
-Opds2Parser::Opds2Parser()
+Opds2Parser::Opds2Parser(OpdsWindowRequest request)
     : parser(JsonCallbacks{this, &sOnKey, &sOnString, &sOnNumber, &sOnBool, nullptr, &sOnObjectStart, &sOnObjectEnd,
-                           &sOnArrayStart, &sOnArrayEnd}) {
-  entryLimit = reserveFeedEntries(entries);
-  if (entryLimit == 0) errorOccured = true;
+                           &sOnArrayStart, &sOnArrayEnd}),
+      window(request) {
+  if (window.reserve(entries) == 0) allocationFailed = errorOccured = true;
+  topNavIndices.reserve(entries.capacity());
 }
 
 void Opds2Parser::setPreferredLanguage(const char* lang) {
@@ -77,10 +79,10 @@ void Opds2Parser::flush() {
   // all" self link). Unrelated navigation stays, but moves below the groups:
   // the richer preview sections lead the screen.
   if (!sawGroups || topNavIndices.empty()) return;
-  std::vector<OpdsEntry> keptNav;
-  keptNav.reserve(topNavIndices.size());
-  for (const uint16_t index : topNavIndices) {
-    const OpdsEntry& nav = entries[index];
+  size_t processed = 0;
+  for (const uint16_t original : topNavIndices) {
+    const size_t index = original - processed++;
+    const auto& nav = entries[index];
     bool duplicate = false;
     for (const auto& entry : entries) {
       if ((!entry.heading.empty() && entry.heading == nav.title) ||
@@ -89,18 +91,15 @@ void Opds2Parser::flush() {
         break;
       }
     }
-    if (!duplicate) keptNav.push_back(entries[index]);
-  }
-  for (auto it = topNavIndices.rbegin(); it != topNavIndices.rend(); ++it) {
-    entries.erase(entries.begin() + *it);
-  }
-  for (auto& nav : keptNav) {
-    entries.push_back(std::move(nav));
+    if (duplicate)
+      entries.erase(entries.begin() + index);
+    else
+      std::rotate(entries.begin() + index, entries.begin() + index + 1, entries.end());
   }
   topNavIndices.clear();
 }
 
-bool Opds2Parser::error() const { return errorOccured || parser.hasError(); }
+bool Opds2Parser::error() const { return errorOccured || parser.hasError() || window.memoryError(); }
 
 void Opds2Parser::assignBounded(std::string& target, const char* value, const size_t len, const size_t maxLen) {
   target.assign(value, len < maxLen ? len : maxLen);
@@ -225,12 +224,12 @@ void Opds2Parser::beginGroup() {
 void Opds2Parser::endGroup() {
   // Field order in the group object is not guaranteed, so the heading and the
   // "see all" entry are applied only once the whole group has been read.
-  if (!groupSelfHref.empty() && entries.size() < entryLimit) {
+  if (!groupSelfHref.empty()) {
     OpdsEntry seeAll;
     seeAll.type = OpdsEntryType::NAVIGATION;
     seeAll.id = OPDS_SEE_ALL_ID;
     seeAll.href = std::move(groupSelfHref);
-    entries.push_back(std::move(seeAll));
+    window.retain(seeAll, entries);
   }
   if (!groupTitle.empty() && entries.size() > groupStartIndex) {
     entries[groupStartIndex].heading = std::move(groupTitle);
@@ -260,7 +259,13 @@ void Opds2Parser::onContainerStart(const bool isObject) {
       resetLink();
       break;
     case Scope::PUB:
-      currentEntry = OpdsEntry{};
+      if (window.wantsDetails()) {
+        // Discovery and loading must charge the same fresh string capacities.
+        OpdsEntry fresh;
+        std::swap(currentEntry, fresh);
+      } else {
+        currentEntry = OpdsEntry{};
+      }
       pubAcqRank = -1;
       pubHasPlainEpub = false;
       break;
@@ -366,14 +371,14 @@ void Opds2Parser::onStringValue(const char* value, const size_t len) {
     case Scope::PUB_META:
       if (strcmp(pendingKey, "title") == 0) {
         assignBounded(currentEntry.title, value, len, MAX_TITLE_CHARS);
-      } else if (strcmp(pendingKey, "author") == 0) {
+      } else if (window.wantsDetails() && strcmp(pendingKey, "author") == 0) {
         if (currentEntry.author.empty()) assignBounded(currentEntry.author, value, len, MAX_AUTHOR_CHARS);
-      } else if (strcmp(pendingKey, "identifier") == 0) {
+      } else if (window.wantsDetails() && strcmp(pendingKey, "identifier") == 0) {
         assignBounded(currentEntry.id, value, len, MAX_ID_CHARS);
       } else if (strcmp(pendingKey, "description") == 0) {
         // Inline feed description: the detail page's source when the
         // publication offers no self document (or that document omits it).
-        assignBounded(currentEntry.description, value, len, MAX_DESCRIPTION_CHARS);
+        if (window.wantsDetails()) assignBounded(currentEntry.description, value, len, MAX_DESCRIPTION_CHARS);
       }
       break;
     case Scope::PUB_TITLE:
@@ -387,17 +392,18 @@ void Opds2Parser::onStringValue(const char* value, const size_t len) {
       }
       break;
     case Scope::AUTHOR:
-      if (strcmp(pendingKey, "name") == 0 && currentEntry.author.empty()) {
+      if (window.wantsDetails() && strcmp(pendingKey, "name") == 0 && currentEntry.author.empty()) {
         assignBounded(currentEntry.author, value, len, MAX_AUTHOR_CHARS);
       }
       break;
     case Scope::AUTHOR_ARR:
       // Array of contributor name strings: take the first.
-      if (currentEntry.author.empty()) assignBounded(currentEntry.author, value, len, MAX_AUTHOR_CHARS);
+      if (window.wantsDetails() && currentEntry.author.empty())
+        assignBounded(currentEntry.author, value, len, MAX_AUTHOR_CHARS);
       break;
     case Scope::PUB_IMAGE:
       // First image entry is the cover, matching the publication-doc parser.
-      if (strcmp(pendingKey, "href") == 0 && currentEntry.coverHref.empty()) {
+      if (window.wantsDetails() && strcmp(pendingKey, "href") == 0 && currentEntry.coverHref.empty()) {
         assignBounded(currentEntry.coverHref, value, len, MAX_HREF_CHARS);
       }
       break;
@@ -452,20 +458,14 @@ void Opds2Parser::commitFeedLink() {
 
 void Opds2Parser::commitNavLink() {
   if (link.href.empty() || link.title.empty()) return;
-  if (entries.size() >= entryLimit) {
-    feedTruncated = true;
-    return;
-  }
   // The stack still holds ... FEED/GROUP > NAV at this point (NAV_LINK was
   // just popped); only top-level navigation participates in group dedup.
-  if (depth >= 2 && stack[depth - 2] == Scope::FEED) {
-    topNavIndices.push_back(static_cast<uint16_t>(entries.size()));
-  }
+  const bool topLevel = depth >= 2 && stack[depth - 2] == Scope::FEED;
   OpdsEntry entry;
   entry.type = OpdsEntryType::NAVIGATION;
   entry.title = std::move(link.title);
   entry.href = std::move(link.href);
-  entries.push_back(std::move(entry));
+  if (window.retain(entry, entries) && topLevel) topNavIndices.push_back(static_cast<uint16_t>(entries.size() - 1));
 }
 
 void Opds2Parser::commitGroupLink() {
@@ -474,11 +474,6 @@ void Opds2Parser::commitGroupLink() {
 
 void Opds2Parser::commitFacetLink() {
   if (link.href.empty() || link.title.empty()) return;
-  if (facetEntries.capacity() == 0) reserveFacetEntries(facetEntries);
-  if (facetEntries.size() >= facetEntries.capacity()) {
-    feedTruncated = true;
-    return;
-  }
   OpdsEntry entry;
   entry.type = OpdsEntryType::NAVIGATION;
   entry.title = std::move(link.title);
@@ -488,7 +483,7 @@ void Opds2Parser::commitFacetLink() {
     snprintf(buf, sizeof(buf), "%ld", static_cast<long>(link.numberOfItems));
     entry.detail = buf;
   }
-  facetEntries.push_back(std::move(entry));
+  if (!window.retainFacet(entry, facetEntries)) feedTruncated = true;
 }
 
 void Opds2Parser::commitPubLink() {
@@ -561,12 +556,8 @@ void Opds2Parser::commitPublication() {
   // preview: keep only the first MAX_GROUP_PREVIEW so a large group doesn't
   // starve the rest. Top-level (flat-feed) publications are not capped.
   if (depth >= 2 && stack[depth - 2] == Scope::GROUP && ++groupPubCount > MAX_GROUP_PREVIEW) return;
-  if (entries.size() >= entryLimit) {
-    feedTruncated = true;
-    return;
-  }
   currentEntry.type = OpdsEntryType::BOOK;
-  entries.push_back(std::move(currentEntry));
+  window.retain(currentEntry, entries);
   currentEntry = OpdsEntry{};
 }
 

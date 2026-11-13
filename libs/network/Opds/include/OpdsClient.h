@@ -29,17 +29,17 @@ class OpdsClient {
  public:
   enum class FetchStatus {
     Ok,
-    AuthFailed,           // login attempted but failed
-    CredentialsMissing,   // server needs login but none is configured
-    ParseFailed,          // response was not a usable feed
-    FetchFailed,          // transport error / non-auth HTTP failure
+    AuthFailed,          // login attempted but failed
+    CredentialsMissing,  // server needs login but none is configured
+    ParseFailed,         // response was not a usable feed
+    MemoryError,         // no entry fits the available heap
+    FetchFailed,         // transport error / non-auth HTTP failure
   };
 
   explicit OpdsClient(OpdsTransport& transport) : http(transport) {}
 
   // --- configuration -------------------------------------------------------
-  void setServer(std::string url, std::string username, std::string password,
-                 std::vector<HttpHeader> headers = {});
+  void setServer(std::string url, std::string username, std::string password, std::vector<HttpHeader> headers = {});
   // Restore a persisted token set (from the SD token store).
   void setTokens(std::string access, std::string refresh, std::string refreshUrl);
   // Accept-Language for content negotiation (localized catalogs); empty sends

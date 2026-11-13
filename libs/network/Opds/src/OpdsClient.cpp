@@ -68,13 +68,13 @@ OpdsClient::FetchStatus OpdsClient::fetchFeed(const std::string& url, OpdsFeedPa
   parser.setPreferredLanguage(primarySubtag(acceptLang).c_str());
   authDirty = false;
   for (int authAttempt = 0;; ++authAttempt) {
-    const HttpResult res =
-        http.get(url, currentAuth(), FEED_ACCEPT, orNull(acceptLang), false,
-                 [&parser](const uint8_t* data, const size_t len) {
-                   parser.write(data, len);
-                   return !parser.error();  // abort the transfer on a parse error
-                 });
-    parser.flush();
+    bool parseStopped = false;
+    const HttpResult res = http.getFeed(url, currentAuth(), FEED_ACCEPT, orNull(acceptLang), false,
+                                        [&parser, &parseStopped](const uint8_t* data, const size_t len) {
+                                          parser.write(data, len);
+                                          parseStopped = parser.error();
+                                          return !parseStopped;  // abort the transfer on a parse error
+                                        });
 
     if (!res.ok && res.status == 401) {
       // The 401 body is an authentication document describing the server's
@@ -104,8 +104,11 @@ OpdsClient::FetchStatus OpdsClient::fetchFeed(const std::string& url, OpdsFeedPa
       }
       return credentialsMissingFlag ? FetchStatus::CredentialsMissing : FetchStatus::AuthFailed;
     }
+    if (!res.ok && !parseStopped) return FetchStatus::FetchFailed;
+    if (parser.memoryError() || (parser.memoryLimited() && !parser.hasEntries())) return FetchStatus::MemoryError;
+    parser.flush();
+    if (parser.memoryError()) return FetchStatus::MemoryError;
     if (parser.error()) return FetchStatus::ParseFailed;
-    if (!res.ok) return FetchStatus::FetchFailed;
     return FetchStatus::Ok;
   }
 }
@@ -113,12 +116,11 @@ OpdsClient::FetchStatus OpdsClient::fetchFeed(const std::string& url, OpdsFeedPa
 bool OpdsClient::fetchPublication(const std::string& docUrl, OpdsPublication& out) {
   std::string doc;
   doc.reserve(4096);
-  http.get(docUrl, currentAuth(), PUB_ACCEPT, orNull(acceptLang), false,
-           [&doc](const uint8_t* data, const size_t len) {
-             const size_t room = doc.size() < MAX_PUB_DOC_BYTES ? MAX_PUB_DOC_BYTES - doc.size() : 0;
-             doc.append(reinterpret_cast<const char*>(data), len < room ? len : room);
-             return true;
-           });
+  http.get(docUrl, currentAuth(), PUB_ACCEPT, orNull(acceptLang), false, [&doc](const uint8_t* data, const size_t len) {
+    const size_t room = doc.size() < MAX_PUB_DOC_BYTES ? MAX_PUB_DOC_BYTES - doc.size() : 0;
+    doc.append(reinterpret_cast<const char*>(data), len < room ? len : room);
+    return true;
+  });
   parseOpdsPublicationDoc(doc.data(), doc.size(), out, primarySubtag(acceptLang).c_str());
   return out.valid;
 }
@@ -128,7 +130,8 @@ bool OpdsClient::resolveIndirect(const std::string& docUrl, std::string& outDown
   doc.reserve(4096);
   const bool fetched = http.get(docUrl, currentAuth(), nullptr, nullptr, false,
                                 [&doc](const uint8_t* data, const size_t len) {
-                                  const size_t room = doc.size() < MAX_PUB_DOC_BYTES ? MAX_PUB_DOC_BYTES - doc.size() : 0;
+                                  const size_t room =
+                                      doc.size() < MAX_PUB_DOC_BYTES ? MAX_PUB_DOC_BYTES - doc.size() : 0;
                                   doc.append(reinterpret_cast<const char*>(data), len < room ? len : room);
                                   return true;
                                 })
@@ -174,12 +177,12 @@ bool OpdsClient::authenticate(const std::string& resourceUrl) {
   // No credentials on the probe, but an auth proxy still needs its headers.
   HttpAuth probe;
   probe.headers = customHeaders;
-  const HttpResult res = http.get(resourceUrl, probe, nullptr, nullptr, true,
-                                  [&body](const uint8_t* data, const size_t len) {
-                                    const size_t room = MAX_AUTH_DOC_BYTES - body.size();
-                                    body.append(reinterpret_cast<const char*>(data), len < room ? len : room);
-                                    return true;
-                                  });
+  const HttpResult res =
+      http.get(resourceUrl, probe, nullptr, nullptr, true, [&body](const uint8_t* data, const size_t len) {
+        const size_t room = MAX_AUTH_DOC_BYTES - body.size();
+        body.append(reinterpret_cast<const char*>(data), len < room ? len : room);
+        return true;
+      });
   if (res.status != 401) return false;  // not an auth challenge
 
   // An empty 401 body is a bare Basic challenge; a JSON body is an OPDS auth
@@ -211,8 +214,8 @@ bool OpdsClient::authenticate(const std::string& resourceUrl) {
         refreshTokenValue.clear();
         extractJsonStringField(response.data(), response.size(), "refresh_token", refreshTokenValue);
         tokenRefreshUrl = refreshTokenValue.empty() ? std::string()
-                          : doc.refreshUrl.empty()   ? tokenUrl
-                                                     : http.resolveUrl(resourceUrl, doc.refreshUrl);
+                          : doc.refreshUrl.empty()  ? tokenUrl
+                                                    : http.resolveUrl(resourceUrl, doc.refreshUrl);
         LOG_INF("OPDS", "OAuth password grant succeeded");
         return true;
       }

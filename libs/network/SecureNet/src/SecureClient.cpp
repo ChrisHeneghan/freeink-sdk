@@ -9,6 +9,7 @@
 #include <wolfssl/ssl.h>
 #if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
 #include <wolfssl/internal.h>
+
 #include <atomic>
 #endif
 #endif
@@ -96,7 +97,8 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
 
   auto* ctx = wolfSSL_CTX_new(static_cast<WOLFSSL_METHOD*>(method));
   if (!ctx) {
-    if (Serial) Serial.printf("[SecureClient] CTX alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
+    if (Serial)
+      Serial.printf("[SecureClient] CTX alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
     _transport.stop();
     return 0;
   }
@@ -105,15 +107,16 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   if (_insecure) {
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
   } else if (_rootCA) {
-    wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA),
-                                   strlen(_rootCA), WOLFSSL_FILETYPE_PEM);
+    wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA), strlen(_rootCA),
+                                   WOLFSSL_FILETYPE_PEM);
   }
   wolfSSL_SetIORecv(ctx, wcRecv);
   wolfSSL_SetIOSend(ctx, wcSend);
 
   auto* ssl = wolfSSL_new(ctx);
   if (!ssl) {
-    if (Serial) Serial.printf("[SecureClient] SSL alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
+    if (Serial)
+      Serial.printf("[SecureClient] SSL alloc failed (%s), free heap %u\n", label, (unsigned)ESP.getFreeHeap());
     stop();
     return 0;
   }
@@ -187,7 +190,8 @@ void SecureClient::reserveFullRecord() {
   // Do not relocate unread ciphertext or a buffer still referenced by plaintext.
   // Normal wolfSSL reads will consume it and grow on demand if necessary.
   if (input.bufferSize >= kFullRecordCapacity || input.length != input.idx ||
-      ssl->buffers.clearOutputBuffer.length != 0) return;
+      ssl->buffers.clearOutputBuffer.length != 0)
+    return;
   SecureClient* expected = nullptr;
   if (!recordReservationOwner.compare_exchange_strong(expected, this)) return;
   // ~16.7 KB is too large for a task stack or permanent DRAM. GrowInputBuffer
@@ -195,8 +199,7 @@ void SecureClient::reserveFullRecord() {
   // the consumer's retention patch reuses it until wolfSSL_free().
   if (GrowInputBuffer(ssl, kFullRecordCapacity, 0) != 0) {
     recordReservationOwner.store(nullptr);
-    if (Serial) Serial.printf("[SecureClient] no full-record buffer, max block %u\n",
-                              (unsigned)ESP.getMaxAllocHeap());
+    if (Serial) Serial.printf("[SecureClient] no full-record buffer, max block %u\n", (unsigned)ESP.getMaxAllocHeap());
   }
 #endif
 }
@@ -208,7 +211,7 @@ bool SecureClient::abortRequested() {
 }
 
 int SecureClient::connect(const char* host, uint16_t port) {
-  _aborted = false;
+  _aborted = _readFailed = false;
   stop();
   if (abortRequested() || !hostResolves(host)) return 0;
   // Negotiate the highest mutually supported version rather than pinning TLS 1.3:
@@ -257,6 +260,7 @@ int SecureClient::read(uint8_t* buf, size_t size) {
     Serial.printf("[SecureClient] read failed: %d, free heap %u, max block %u\n", err, (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMaxAllocHeap());
   }
+  _readFailed = true;
   _connected = false;
   return -1;
 }
@@ -267,13 +271,19 @@ int SecureClient::available() {
 }
 
 void SecureClient::stop() {
-  if (_ssl) { wolfSSL_free(static_cast<WOLFSSL*>(_ssl)); _ssl = nullptr; }
+  if (_ssl) {
+    wolfSSL_free(static_cast<WOLFSSL*>(_ssl));
+    _ssl = nullptr;
+  }
 #if defined(FREEINK_WOLFSSL_RETAIN_INPUT_BUFFER)
   // Release admission only after wolfSSL has freed its connection-owned memory.
   SecureClient* expected = this;
   recordReservationOwner.compare_exchange_strong(expected, nullptr);
 #endif
-  if (_ctx) { wolfSSL_CTX_free(static_cast<WOLFSSL_CTX*>(_ctx)); _ctx = nullptr; }
+  if (_ctx) {
+    wolfSSL_CTX_free(static_cast<WOLFSSL_CTX*>(_ctx));
+    _ctx = nullptr;
+  }
   _transport.stop();
   _connected = false;
 }
@@ -283,15 +293,31 @@ uint8_t SecureClient::connected() { return _connected && _transport.connected();
 #else  // !FREEINK_NET_WOLFSSL — inert stub so the SDK builds without wolfSSL.
 
 int SecureClient::connect(const char* host, uint16_t port) {
-  (void)host; (void)port;
+  (void)host;
+  (void)port;
   if (Serial) Serial.println("[SecureClient] TLS 1.3 unavailable: build with -DFREEINK_NET_WOLFSSL=1");
   return 0;
 }
-int SecureClient::connect(IPAddress ip, uint16_t port) { (void)ip; (void)port; return 0; }
-size_t SecureClient::write(const uint8_t* buf, size_t size) { (void)buf; (void)size; return 0; }
-int SecureClient::read(uint8_t* buf, size_t size) { (void)buf; (void)size; return -1; }
+int SecureClient::connect(IPAddress ip, uint16_t port) {
+  (void)ip;
+  (void)port;
+  return 0;
+}
+size_t SecureClient::write(const uint8_t* buf, size_t size) {
+  (void)buf;
+  (void)size;
+  return 0;
+}
+int SecureClient::read(uint8_t* buf, size_t size) {
+  (void)buf;
+  (void)size;
+  return -1;
+}
 int SecureClient::available() { return 0; }
-void SecureClient::stop() { _transport.stop(); _connected = false; }
+void SecureClient::stop() {
+  _transport.stop();
+  _connected = false;
+}
 uint8_t SecureClient::connected() { return 0; }
 
 #endif

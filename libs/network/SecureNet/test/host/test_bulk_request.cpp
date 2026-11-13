@@ -8,6 +8,7 @@
 namespace {
 int reservations = 0, liveReservations = 0;
 bool failWrite = false;
+bool failRead = false;
 bool peerClosesNow = false;  // the server closes the open connection at the next connected() check
 }  // namespace
 namespace freeink {
@@ -34,7 +35,11 @@ void SecureClient::reserveFullRecord() {
 }
 int SecureClient::available() { return _transport.available(); }
 int SecureClient::read() { return _transport.read(); }
-int SecureClient::read(uint8_t* buf, size_t size) { return _transport.read(buf, size); }
+int SecureClient::read(uint8_t* buf, size_t size) {
+  const int result = _transport.read(buf, size);
+  if (result < 0 && failRead) _readFailed = true;
+  return result;
+}
 int SecureClient::peek() { return _transport.peek(); }
 void SecureClient::flush() {}
 void SecureClient::stop() {
@@ -65,6 +70,15 @@ void reset(std::initializer_list<const char*> replies) {
   FakeNet::hosts().clear();
 }
 int main() {
+  for (bool error : {false, true}) {
+    reset({"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial"});
+    freeink::SecureHttpClient http;
+    assert(http.begin("https://a/feed"));
+    failRead = error;
+    assert(http.GET([](const uint8_t*, size_t) { return true; }) == 200);
+    assert(http.responseComplete() == !error);
+  }
+
   for (bool reserve : {false, true}) {
     for (const char* url : {"http://a/book", "https://a/book"}) {
       reset({"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"});

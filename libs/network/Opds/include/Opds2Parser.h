@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "OpdsEntry.h"
+#include "OpdsFeedWindow.h"
 
 /**
  * Streaming parser for OPDS 2.0 JSON catalog feeds (application/opds+json).
@@ -31,7 +32,7 @@
  */
 class Opds2Parser final : public Print {
  public:
-  Opds2Parser();
+  explicit Opds2Parser(OpdsWindowRequest request = {});
 
   Opds2Parser(const Opds2Parser&) = delete;
   Opds2Parser& operator=(const Opds2Parser&) = delete;
@@ -46,7 +47,12 @@ class Opds2Parser final : public Print {
   void flush() override;
 
   bool error() const;
-  bool truncated() const { return feedTruncated; }
+  bool truncated() const { return feedTruncated || window.hasMore(); }
+  bool hasMoreEntries() const { return window.hasMore(); }
+  size_t nextEntryOffset() const { return window.nextOffset(); }
+  size_t firstEntryOffset() const { return window.firstOffset(); }
+  bool memoryError() const { return allocationFailed || window.memoryError(); }
+  bool memoryLimited() const { return window.memoryLimited(); }
 
   const std::vector<OpdsEntry>& getEntries() const& { return entries; }
   std::vector<OpdsEntry> getEntries() && { return std::move(entries); }
@@ -145,6 +151,7 @@ class Opds2Parser final : public Print {
   uint8_t depth = 0;
   bool sawRoot = false;
   bool errorOccured = false;
+  bool allocationFailed = false;
   bool feedTruncated = false;
 
   char pendingKey[24] = {0};
@@ -158,7 +165,7 @@ class Opds2Parser final : public Print {
   bool pendingKeyIsPreferred() const;
 
   std::vector<OpdsEntry> entries;
-  size_t entryLimit = 0;  // set by reserveFeedEntries()
+  OpdsFeedWindow window;
   std::vector<OpdsEntry> facetEntries;
   OpdsEntry currentEntry;
 
@@ -180,7 +187,7 @@ class Opds2Parser final : public Print {
     bool typeEpub = false;
     bool typeIndirect = false;  // application/opds-publication+json acquisition
     bool typePubDoc = false;    // application/opds-publication+json (any rel)
-    bool typeLcp = false;  // application/vnd.readium.lcp.license.v1.0+json
+    bool typeLcp = false;       // application/vnd.readium.lcp.license.v1.0+json
     bool templated = false;
     int32_t numberOfItems = -1;
     std::string priceValue;     // raw decimal from the price object
