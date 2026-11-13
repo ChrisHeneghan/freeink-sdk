@@ -318,6 +318,9 @@ class SecureHttpClient {
         _bodyComplete = false;
       }
 
+      // A fatal TLS read is not the clean EOF that terminates an unframed body.
+      if (_connHttps && _secure.readFailed()) _bodyComplete = false;
+
       // Reuse only a provably clean connection. An aborted/truncated body
       // leaves undrained bytes on the socket, and the next request would parse
       // leftover body data as its status line.

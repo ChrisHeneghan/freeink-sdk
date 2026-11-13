@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "OpdsEntry.h"
+#include "OpdsFeedWindow.h"
 
 // Legacy alias for backward compatibility
 using OpdsBook = OpdsEntry;
@@ -28,7 +29,7 @@ using OpdsBook = OpdsEntry;
  */
 class OpdsParser final : public Print {
  public:
-  OpdsParser();
+  explicit OpdsParser(OpdsWindowRequest request = {});
   ~OpdsParser();
 
   // Disable copy
@@ -62,7 +63,12 @@ class OpdsParser final : public Print {
   void flush() override;
 
   bool error() const;
-  bool truncated() const { return feedTruncated; }
+  bool truncated() const { return feedTruncated || window.hasMore(); }
+  bool hasMoreEntries() const { return window.hasMore(); }
+  size_t nextEntryOffset() const { return window.nextOffset(); }
+  size_t firstEntryOffset() const { return window.firstOffset(); }
+  bool memoryError() const { return allocationFailed || window.memoryError(); }
+  bool memoryLimited() const { return window.memoryLimited(); }
 
   operator bool() { return !error(); }
 
@@ -110,7 +116,7 @@ class OpdsParser final : public Print {
 
   XML_Parser parser = nullptr;
   std::vector<OpdsEntry> entries;
-  size_t entryLimit = 0;  // set by reserveFeedEntries()
+  OpdsFeedWindow window;
   std::vector<OpdsEntry> facetEntries;
   // facetGroup of the last collected facet link; a change starts a new
   // section heading.
@@ -152,5 +158,6 @@ class OpdsParser final : public Print {
   bool descInMarkup = false;
 
   bool errorOccured = false;
+  bool allocationFailed = false;
   bool feedTruncated = false;
 };

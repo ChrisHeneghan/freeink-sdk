@@ -8,6 +8,7 @@
 namespace {
 int reservations = 0, liveReservations = 0;
 bool failWrite = false;
+bool failRead = false;
 bool peerClosesNow = false;  // the server closes the open connection at the next connected() check
 }  // namespace
 namespace freeink {
@@ -34,7 +35,11 @@ void SecureClient::reserveFullRecord() {
 }
 int SecureClient::available() { return _transport.available(); }
 int SecureClient::read() { return _transport.read(); }
-int SecureClient::read(uint8_t* buf, size_t size) { return _transport.read(buf, size); }
+int SecureClient::read(uint8_t* buf, size_t size) {
+  const int result = _transport.read(buf, size);
+  if (result < 0 && failRead) _readFailed = true;
+  return result;
+}
 int SecureClient::peek() { return _transport.peek(); }
 void SecureClient::flush() {}
 void SecureClient::stop() {
@@ -65,6 +70,15 @@ void reset(std::initializer_list<const char*> replies) {
   FakeNet::hosts().clear();
 }
 int main() {
+  for (bool error : {false, true}) {
+    reset({"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial"});
+    freeink::SecureHttpClient http;
+    assert(http.begin("https://a/feed"));
+    failRead = error;
+    assert(http.GET([](const uint8_t*, size_t) { return true; }) == 200);
+    assert(http.responseComplete() == !error);
+  }
+
   for (bool reserve : {false, true}) {
     for (const char* url : {"http://a/book", "https://a/book"}) {
       reset({"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"});
@@ -112,8 +126,8 @@ int main() {
 
   // A kept-alive connection that the server closed between requests: the
   // request is sent again once, on a fresh connection.
-  reset({"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcHTTP/1.1 2",
-         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ndef"});
+  reset(
+      {"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcHTTP/1.1 2", "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ndef"});
   {
     freeink::SecureHttpClient http;
     assert(http.begin("https://a/one"));
@@ -152,8 +166,9 @@ int main() {
       return false;
     };
     const std::string payload = "pay once";
-    assert(http.sendRequest("POST", reinterpret_cast<const uint8_t*>(payload.data()), payload.size(),
-                            [](const uint8_t*, size_t) { return true; }, closeBeforeRequest) < 0);
+    assert(http.sendRequest(
+               "POST", reinterpret_cast<const uint8_t*>(payload.data()), payload.size(),
+               [](const uint8_t*, size_t) { return true; }, closeBeforeRequest) < 0);
     assert(FakeNet::hosts().size() == 2 && FakeNet::replies().size() == 1);
   }
   // GitHub release assets redirect with a >4KB Content-Security-Policy header.
@@ -162,8 +177,8 @@ int main() {
   const std::string longCsp = cspPrefix + std::string(4173 - cspPrefix.size(), 'x');
   assert(longCsp.size() == 4173);
   const std::string location = "https://cdn.example/asset?" + std::string(900, 'q');
-  const std::string redirect = "HTTP/1.1 302 Found\r\n" + longCsp + "\r\nLocation: " + location +
-                               "\r\nContent-Length: 0\r\n\r\n";
+  const std::string redirect =
+      "HTTP/1.1 302 Found\r\n" + longCsp + "\r\nLocation: " + location + "\r\nContent-Length: 0\r\n\r\n";
   reset({redirect.c_str(), "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"});
   {
     freeink::FetchSink fontSink;
@@ -181,8 +196,8 @@ int main() {
 
   // Oversized framing/redirect headers still fail rather than being discarded.
   for (const char* name : {"Location", "Content-Length", "Transfer-Encoding"}) {
-    const std::string malformed = std::string("HTTP/1.1 200 OK\r\n") + name + ": " +
-                                  std::string(4200, 'x') + "\r\nContent-Length: 2\r\n\r\nok";
+    const std::string malformed =
+        std::string("HTTP/1.1 200 OK\r\n") + name + ": " + std::string(4200, 'x') + "\r\nContent-Length: 2\r\n\r\nok";
     reset({malformed.c_str()});
     freeink::SecureHttpClient http;
     assert(http.begin("https://a/font"));
@@ -190,8 +205,8 @@ int main() {
     assert(liveReservations == 0);
   }
   // Even discardable headers must fit within the total header budget.
-  const std::string tooLongCsp = "HTTP/1.1 200 OK\r\n" + cspPrefix + std::string(8200, 'x') +
-                                 "\r\nContent-Length: 2\r\n\r\nok";
+  const std::string tooLongCsp =
+      "HTTP/1.1 200 OK\r\n" + cspPrefix + std::string(8200, 'x') + "\r\nContent-Length: 2\r\n\r\nok";
   reset({tooLongCsp.c_str()});
   {
     freeink::SecureHttpClient http;

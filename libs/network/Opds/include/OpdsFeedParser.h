@@ -35,6 +35,15 @@ class OpdsFeedParser final : public Print {
 
   bool error() const;
   bool truncated() const;
+  // Previous mode reports first/next offsets without retaining entries.
+  // Reset the backend before loading that range in Forward mode.
+  void setWindow(OpdsWindowRequest value) { request = value; }
+  bool hasMoreEntries() const;
+  size_t nextEntryOffset() const;
+  size_t firstEntryOffset() const;
+  bool memoryLimited() const;
+  bool memoryError() const;
+  bool hasEntries() const;
 
   // True when the feed parsed as OPDS 2.0 JSON.
   bool isOpds2() const { return jsonParser != nullptr; }
@@ -64,5 +73,6 @@ class OpdsFeedParser final : public Print {
   std::unique_ptr<Opds2Parser> jsonParser;
   uint8_t bomBytesSkipped = 0;
   bool allocFailed = false;
+  OpdsWindowRequest request;
   char preferredLang[12] = {0};
 };

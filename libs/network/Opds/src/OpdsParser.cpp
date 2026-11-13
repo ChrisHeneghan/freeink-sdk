@@ -10,40 +10,15 @@
 
 using namespace OpdsLimits;
 
-namespace {
-constexpr size_t STRING_HEADROOM_BYTES = 4096;  // left for the entries' own strings
-constexpr size_t MIN_ENTRY_CAPACITY = 8;
-
-size_t affordableEntries(const size_t cap) {
-  const size_t block = ESP.getMaxAllocHeap();
-  return std::min(cap, block > STRING_HEADROOM_BYTES ? (block - STRING_HEADROOM_BYTES) / sizeof(OpdsEntry) : 0);
-}
-}  // namespace
-
-size_t OpdsLimits::reserveFeedEntries(std::vector<OpdsEntry>& entries) {
-  const size_t capacity = affordableEntries(ENTRY_STORAGE_CAPACITY);
-  if (capacity < MIN_ENTRY_CAPACITY) {
-    LOG_ERR("OPDS", "OOM: room for %u feed entries", static_cast<unsigned>(capacity));
-    return 0;
-  }
-  entries.reserve(capacity);
-  return capacity - (ENTRY_STORAGE_CAPACITY - MAX_ENTRIES);
-}
-
-void OpdsLimits::reserveFacetEntries(std::vector<OpdsEntry>& facets) {
-  facets.reserve(affordableEntries(MAX_FACET_ENTRIES));
-}
-
-OpdsParser::OpdsParser() {
+OpdsParser::OpdsParser(OpdsWindowRequest request) : window(request) {
   // Before expat: it allocates nothing large and fails without aborting.
-  entryLimit = reserveFeedEntries(entries);
-  if (entryLimit == 0) {
-    errorOccured = true;
+  if (window.reserve(entries) == 0) {
+    allocationFailed = errorOccured = true;
     return;
   }
   parser = XML_ParserCreate(nullptr);
   if (!parser) {
-    errorOccured = true;
+    allocationFailed = errorOccured = true;
     LOG_DBG("OPDS", "Couldn't allocate memory for parser");
     return;
   }
@@ -67,7 +42,7 @@ size_t OpdsParser::write(const uint8_t* xmlData, const size_t length) {
     const size_t toRead = remaining < chunkSize ? remaining : chunkSize;
     void* const buf = XML_GetBuffer(parser, toRead);
     if (!buf) {
-      errorOccured = true;
+      allocationFailed = errorOccured = true;
       LOG_DBG("OPDS", "Couldn't allocate memory for buffer");
       destroyXmlParser(parser);
       return length;
@@ -76,6 +51,7 @@ size_t OpdsParser::write(const uint8_t* xmlData, const size_t length) {
     memcpy(buf, currentPos, toRead);
 
     if (XML_ParseBuffer(parser, static_cast<int>(toRead), 0) == XML_STATUS_ERROR) {
+      allocationFailed = XML_GetErrorCode(parser) == XML_ERROR_NO_MEMORY;
       errorOccured = true;
       LOG_DBG("OPDS", "Parse error at line %lu: %s", XML_GetCurrentLineNumber(parser),
               XML_ErrorString(XML_GetErrorCode(parser)));
@@ -91,12 +67,13 @@ size_t OpdsParser::write(const uint8_t* xmlData, const size_t length) {
 void OpdsParser::flush() {
   if (errorOccured || !parser) return;
   if (XML_Parse(parser, nullptr, 0, XML_TRUE) != XML_STATUS_OK) {
+    allocationFailed = XML_GetErrorCode(parser) == XML_ERROR_NO_MEMORY;
     errorOccured = true;
     destroyXmlParser(parser);
   }
 }
 
-bool OpdsParser::error() const { return errorOccured; }
+bool OpdsParser::error() const { return errorOccured || window.memoryError(); }
 
 void OpdsParser::clear() {
   entries.clear();
@@ -173,9 +150,14 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
 
   if (strcmp(name, "entry") == 0 || strstr(name, ":entry") != nullptr) {
     self->inEntry = true;
-    self->collectCurrentEntry = self->entries.size() < self->entryLimit;
-    self->feedTruncated = self->feedTruncated || !self->collectCurrentEntry;
-    self->currentEntry = OpdsEntry{};
+    self->collectCurrentEntry = true;
+    if (self->window.wantsDetails()) {
+      // Discovery and loading must charge the same fresh string capacities.
+      OpdsEntry fresh;
+      std::swap(self->currentEntry, fresh);
+    } else {
+      self->currentEntry = OpdsEntry{};
+    }
     self->currentText.clear();
     self->inTitle = self->inAuthor = self->inAuthorName = self->inId = false;
     self->inSummary = self->summaryIsContent = self->descInMarkup = false;
@@ -227,9 +209,7 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
         assignBounded(self->historyUrl, href, MAX_PAGE_URL_CHARS);
       } else if (rel && strstr(rel, "opds-spec.org/facet") != nullptr && !self->inEntry) {
         const char* title = findAttribute(atts, "title");
-        if (self->facetEntries.capacity() == 0) reserveFacetEntries(self->facetEntries);
-        if (self->facetEntries.size() >= self->facetEntries.capacity()) self->feedTruncated = true;
-        if (title && title[0] != '\0' && self->facetEntries.size() < self->facetEntries.capacity()) {
+        if (title && title[0] != '\0') {
           OpdsEntry facet;
           facet.type = OpdsEntryType::NAVIGATION;
           assignBounded(facet.title, title, MAX_TITLE_CHARS);
@@ -239,9 +219,9 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
           const char* group = findAttributeLocal(atts, "facetGroup");
           if (group && self->lastFacetGroup != group) {
             assignBounded(facet.heading, group, MAX_TITLE_CHARS);
-            self->lastFacetGroup = group;
+            assignBounded(self->lastFacetGroup, group, MAX_TITLE_CHARS);
           }
-          self->facetEntries.push_back(std::move(facet));
+          if (!self->window.retainFacet(facet, self->facetEntries)) self->feedTruncated = true;
         }
       }
 
@@ -255,11 +235,11 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
           // Prefer higher-ranked acquisitions (open-access over borrow,
           // never buy/sample); at equal rank prefer a direct EPUB over an
           // LCP license, and a plain EPUB path over derived formats.
-          const bool isPlainEpub = isEpubType && (strstr(href, ".epub") != nullptr || strstr(href, "/epub/") != nullptr);
-          const bool better =
-              self->currentEntry.type != OpdsEntryType::BOOK || rank > self->entryAcqRank ||
-              (rank == self->entryAcqRank &&
-               ((isEpubType && self->currentEntry.lcpLicense) || (isPlainEpub && !self->entryHasPlainEpub)));
+          const bool isPlainEpub =
+              isEpubType && (strstr(href, ".epub") != nullptr || strstr(href, "/epub/") != nullptr);
+          const bool better = self->currentEntry.type != OpdsEntryType::BOOK || rank > self->entryAcqRank ||
+                              (rank == self->entryAcqRank && ((isEpubType && self->currentEntry.lcpLicense) ||
+                                                              (isPlainEpub && !self->entryHasPlainEpub)));
           if (better) {
             self->currentEntry.type = OpdsEntryType::BOOK;
             assignBounded(self->currentEntry.href, href, MAX_HREF_CHARS);
@@ -275,7 +255,7 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
             self->currentEntry.type = OpdsEntryType::NAVIGATION;
             assignBounded(self->currentEntry.href, href, MAX_HREF_CHARS);
           }
-        } else if (rel && strstr(rel, "opds-spec.org/image") != nullptr) {
+        } else if (self->window.wantsDetails() && rel && strstr(rel, "opds-spec.org/image") != nullptr) {
           // Cover art: prefer the full image; a thumbnail only fills a gap.
           if (strstr(rel, "/thumbnail") == nullptr || self->currentEntry.coverHref.empty()) {
             assignBounded(self->currentEntry.coverHref, href, MAX_HREF_CHARS);
@@ -316,12 +296,12 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
   if (strcmp(name, "title") == 0 || strstr(name, ":title") != nullptr) {
     self->inTitle = true;
     self->currentText.clear();
-  } else if (strcmp(name, "author") == 0 || strstr(name, ":author") != nullptr) {
+  } else if (self->window.wantsDetails() && (strcmp(name, "author") == 0 || strstr(name, ":author") != nullptr)) {
     self->inAuthor = true;
   } else if (self->inAuthor && (strcmp(name, "name") == 0 || strstr(name, ":name") != nullptr)) {
     self->inAuthorName = true;
     self->currentText.clear();
-  } else if (strcmp(name, "id") == 0 || strstr(name, ":id") != nullptr) {
+  } else if (self->window.wantsDetails() && (strcmp(name, "id") == 0 || strstr(name, ":id") != nullptr)) {
     self->inId = true;
     self->currentText.clear();
   } else if (strcmp(name, "summary") == 0 || strstr(name, ":summary") != nullptr || strcmp(name, "content") == 0 ||
@@ -338,7 +318,7 @@ void XMLCALL OpdsParser::endElement(void* userData, const XML_Char* name) {
 
   if (strcmp(name, "entry") == 0 || strstr(name, ":entry") != nullptr) {
     if (self->collectCurrentEntry && !self->currentEntry.title.empty() && !self->currentEntry.href.empty()) {
-      self->entries.push_back(self->currentEntry);
+      self->window.retain(self->currentEntry, self->entries);
     }
     self->inEntry = false;
     self->collectCurrentEntry = false;
@@ -405,6 +385,7 @@ void XMLCALL OpdsParser::characterData(void* userData, const XML_Char* s, const 
   }
   if (!self->collectCurrentEntry) return;
   if (self->inSummary) {
+    if (!self->window.wantsDetails()) return;
     for (int i = 0; i < len && self->currentText.size() < MAX_DESCRIPTION_CHARS; ++i) {
       const char c = s[i];
       if (c == '<') {

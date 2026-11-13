@@ -203,3 +203,18 @@ sh libs/network/JsonSax/test/host/run.sh
 
 Checks optional bounded string prefixes, unchanged default overflow handling,
 continued parsing after long strings, and rejection of oversized keys under ASan/UBSan.
+
+## OPDS feed windows
+
+```sh
+python3 libs/network/Opds/test/host/run.py
+```
+
+Requires a host Expat library (`-lexpat`). Runs the production Atom/JSON parsers
+and OPDS client with heap and transport adapters under AddressSanitizer and
+UndefinedBehaviorSanitizer. Covers repeatable continuation across entry and byte limits, insufficient or
+fragmented internal RAM, malformed/incomplete feeds, Basic retries, and preceding-range
+discovery using constant cursor state. Consumers must reset the discovery parser
+before loading the discovered range to avoid keeping two backends alive. The
+consumer must test its staged-feed transport and measure Expat/TLS allocations
+on hardware; the C++ allocation adapter alone does not model them.

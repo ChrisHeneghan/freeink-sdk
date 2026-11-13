@@ -1,9 +1,9 @@
 #include "OpdsFeedParser.h"
 
 #include <OpdsLog.h>
-#include <new>
 
 #include <cctype>
+#include <new>
 
 namespace {
 const std::string kNoValue;
@@ -20,8 +20,13 @@ void OpdsFeedParser::setPreferredLanguage(const char* lang) {
 }
 
 bool OpdsFeedParser::selectBackend(const uint8_t firstByte) {
+  if (!OpdsFeedWindow::hasWorkspace(firstByte == '{' ? sizeof(Opds2Parser) : sizeof(OpdsParser))) {
+    LOG_ERR("OPDS", "Insufficient feed workspace");
+    allocFailed = true;
+    return false;
+  }
   if (firstByte == '{') {
-    jsonParser.reset(new (std::nothrow) Opds2Parser());
+    jsonParser.reset(new (std::nothrow) Opds2Parser(request));
     if (!jsonParser) {
       LOG_ERR("OPDS", "OOM: OPDS 2.0 parser");
       allocFailed = true;
@@ -30,7 +35,7 @@ bool OpdsFeedParser::selectBackend(const uint8_t firstByte) {
     jsonParser->setPreferredLanguage(preferredLang);
     LOG_DBG("OPDS", "Feed detected as OPDS 2.0 (JSON)");
   } else {
-    xmlParser.reset(new (std::nothrow) OpdsParser());
+    xmlParser.reset(new (std::nothrow) OpdsParser(request));
     if (!xmlParser) {
       LOG_ERR("OPDS", "OOM: OPDS 1.x parser");
       allocFailed = true;
@@ -181,4 +186,25 @@ const std::string& OpdsFeedParser::getHistoryUrl() const {
   if (jsonParser) return jsonParser->getHistoryUrl();
   if (xmlParser) return xmlParser->getHistoryUrl();
   return kNoValue;
+}
+
+bool OpdsFeedParser::hasMoreEntries() const {
+  return jsonParser ? jsonParser->hasMoreEntries() : xmlParser && xmlParser->hasMoreEntries();
+}
+size_t OpdsFeedParser::nextEntryOffset() const {
+  return jsonParser ? jsonParser->nextEntryOffset() : xmlParser ? xmlParser->nextEntryOffset() : request.start;
+}
+size_t OpdsFeedParser::firstEntryOffset() const {
+  return jsonParser ? jsonParser->firstEntryOffset() : xmlParser ? xmlParser->firstEntryOffset() : request.start;
+}
+bool OpdsFeedParser::memoryLimited() const {
+  return allocFailed || (jsonParser && jsonParser->memoryLimited()) || (xmlParser && xmlParser->memoryLimited());
+}
+
+bool OpdsFeedParser::hasEntries() const {
+  return jsonParser ? !jsonParser->getEntries().empty() : xmlParser && !xmlParser->getEntries().empty();
+}
+
+bool OpdsFeedParser::memoryError() const {
+  return allocFailed || (jsonParser && jsonParser->memoryError()) || (xmlParser && xmlParser->memoryError());
 }

@@ -29,7 +29,7 @@ struct HttpAuth {
   std::vector<HttpHeader> headers;
 };
 
-// Outcome of a streaming GET: ok is true for a 2xx response, status carries the
+// Outcome of a streaming GET: ok is true for a complete 2xx response, status carries the
 // final HTTP code (0 when the request never reached a response).
 struct HttpResult {
   bool ok = false;
@@ -46,13 +46,19 @@ class OpdsTransport {
   // Streaming GET. `accept`/`acceptLanguage` are sent when non-null. When
   // `captureErrorBody` is set, a 401 body is also streamed to `onChunk` (OPDS
   // authentication documents are served as 401 bodies).
-  virtual HttpResult get(const std::string& url, const HttpAuth& auth, const char* accept,
-                         const char* acceptLanguage, bool captureErrorBody, const OpdsDataSink& onChunk) = 0;
+  virtual HttpResult get(const std::string& url, const HttpAuth& auth, const char* accept, const char* acceptLanguage,
+                         bool captureErrorBody, const OpdsDataSink& onChunk) = 0;
+
+  // Feed bodies may be staged by the consumer and replayed after HTTP closes.
+  // Authentication and other small documents continue to use get().
+  virtual HttpResult getFeed(const std::string& url, const HttpAuth& auth, const char* accept,
+                             const char* acceptLanguage, bool captureErrorBody, const OpdsDataSink& onChunk) {
+    return get(url, auth, accept, acceptLanguage, captureErrorBody, onChunk);
+  }
 
   // POST an application/x-www-form-urlencoded body (an OAuth token request) and
   // collect the response. Returns true on a 2xx status; fills outStatus.
-  virtual bool postForm(const std::string& url, const std::string& body, std::string& outResponse,
-                        int& outStatus) = 0;
+  virtual bool postForm(const std::string& url, const std::string& body, std::string& outResponse, int& outStatus) = 0;
 
   // Resolve a possibly-relative href against a base URL, applying whatever URL
   // normalisation the HTTP client requires.
